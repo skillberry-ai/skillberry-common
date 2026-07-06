@@ -1,0 +1,385 @@
+# ============================================================================
+# Shared Reusable Workflow: Label New PRs with Bob
+# ============================================================================
+#
+# PURPOSE:
+# Automatically labels new pull requests using IBM Bob Shell.
+# This workflow is triggered by the local `label-new-prs-trigger.yml` in each
+# repo via workflow_run (to access secrets from forked PRs), OR called directly
+# via workflow_call for manual dispatch.
+#
+# REQUIRED SECRETS (passed via `secrets: inherit` from caller):
+#   BOBSHELL_API_KEY      — Bob Shell API key
+#   SKILLBERRY_BOT_TOKEN  — PAT with pull-requests write permission
+#
+# USAGE (in caller repo):
+#   jobs:
+#     call-label-prs:
+#       uses: skillberry-ai/skillberry-common/.github/workflows/label-new-prs.yml@main
+#       secrets: inherit
+# ============================================================================
+
+name: Label New PRs (shared)
+
+on:
+  workflow_call:
+
+jobs:
+  label-new-prs:
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Get PR details from workflow run
+        id: get_pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+          script: |
+            let prNumber;
+
+            // Check if manually triggered
+            if (context.eventName === 'workflow_dispatch') {
+              prNumber = context.payload.inputs.pr_number;
+              core.info(`Manual trigger for PR #${prNumber}`);
+            } else {
+              // workflow_run path: download artifact from trigger workflow
+              const workflowRun = context.payload.workflow_run;
+
+              core.info(`Workflow run ID: ${workflowRun.id}`);
+
+              const { data: artifacts } = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: workflowRun.id,
+                per_page: 100
+              });
+
+              const payloadArtifact = artifacts.artifacts?.find(artifact => artifact.name === 'pr-context');
+              if (!payloadArtifact) {
+                core.setFailed('Could not find pr-context artifact on trigger workflow run');
+                return;
+              }
+
+              core.info(`Found artifact ${payloadArtifact.name} (${payloadArtifact.id})`);
+
+              const zipResponse = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: payloadArtifact.id,
+                archive_format: 'zip'
+              });
+
+              const fs = require('fs');
+              const os = require('os');
+              const path = require('path');
+              const { execFileSync } = require('child_process');
+
+              const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bob-pr-label-'));
+              const zipPath = path.join(tempDir, 'artifact.zip');
+              const zipBuffer = Buffer.isBuffer(zipResponse.data)
+                ? zipResponse.data
+                : Buffer.from(zipResponse.data);
+              fs.writeFileSync(zipPath, zipBuffer);
+              execFileSync('unzip', ['-o', zipPath, '-d', tempDir], { stdio: 'inherit' });
+
+              const payloadPath = path.join(tempDir, 'pr-context.json');
+              const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
+
+              prNumber = payload.pr_number;
+              core.info(`Loaded PR #${prNumber} from trigger artifact`);
+            }
+
+            // Fetch PR details
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('pr_title', pr.title);
+            core.setOutput('pr_body', pr.body || '');
+            core.setOutput('pr_author', pr.user.login);
+            core.setOutput('head_ref', pr.head.ref);
+
+            core.info(`Will process PR #${pr.number}: ${pr.title}`);
+
+      - name: Fetch Repository Labels
+        id: fetch_labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          echo "Fetching repository labels..."
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/labels" \
+            --paginate > /tmp/all_labels.json
+
+          # Format labels for Bob Shell (exclude fix-with-bob)
+          LABELS_INFO=$(jq -r '.[] | select(.name != "fix-with-bob") | "- **\(.name)**: \(.description // "No description")"' /tmp/all_labels.json)
+
+          echo "Available labels (excluding fix-with-bob):"
+          echo "${LABELS_INFO}"
+
+          echo "${LABELS_INFO}" > /tmp/labels_info.txt
+
+          LABEL_COUNT=$(echo "${LABELS_INFO}" | wc -l)
+          echo "label_count=${LABEL_COUNT}" >> $GITHUB_OUTPUT
+
+      - name: Get PR Details and Files
+        id: pr_details
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.get_pr.outputs.pr_number }}"
+
+          echo "Fetching PR details for #${PR_NUMBER}..."
+
+          EXISTING_LABELS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            --jq '[.[] | .name] | join(", ")')
+
+          echo "Existing labels: ${EXISTING_LABELS}"
+          echo "existing_labels=${EXISTING_LABELS}" >> $GITHUB_OUTPUT
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" \
+            --paginate > /tmp/pr_files.json
+
+          FILES_INFO=$(jq -r '.[] | "- \(.filename) (+\(.additions)/-\(.deletions))"' /tmp/pr_files.json)
+
+          echo "Changed files:"
+          echo "${FILES_INFO}"
+
+          echo "${FILES_INFO}" > /tmp/files_info.txt
+
+          FILE_COUNT=$(echo "${FILES_INFO}" | wc -l)
+          echo "file_count=${FILE_COUNT}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Bob Shell
+        run: |
+          echo "Installing Bob Shell..."
+          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm
+
+          if command -v bob &> /dev/null; then
+            echo "Bob Shell installed successfully"
+            bob --version
+          else
+            echo "Bob Shell installation failed"
+            exit 1
+          fi
+
+      - name: Authenticate Bob Shell
+        env:
+          BOBSHELL_API_KEY: ${{ secrets.BOBSHELL_API_KEY }}
+        run: |
+          echo "Configuring Bob Shell authentication..."
+          if [ -z "$BOBSHELL_API_KEY" ]; then
+            echo "Error: BOBSHELL_API_KEY secret is not set"
+            exit 1
+          fi
+          echo "Bob Shell authentication configured successfully"
+
+      - name: Execute Bob to Suggest Labels
+        id: suggest_labels
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 10
+          command: |
+            LABELS_INFO=$(cat /tmp/labels_info.txt)
+            FILES_INFO=$(cat /tmp/files_info.txt)
+
+            PR_TITLE="${{ steps.get_pr.outputs.pr_title }}"
+            PR_BODY="${{ steps.get_pr.outputs.pr_body }}"
+            PR_AUTHOR="${{ steps.get_pr.outputs.pr_author }}"
+            EXISTING_LABELS="${{ steps.pr_details.outputs.existing_labels }}"
+
+            PROMPT="Analyze this pull request and suggest relevant labels from the available repository labels.
+
+            **Pull Request Information:**
+            - **Number**: #${{ steps.get_pr.outputs.pr_number }}
+            - **Title**: ${PR_TITLE}
+            - **Author**: @${PR_AUTHOR}
+            - **Description**: ${PR_BODY}
+
+            **Existing Labels**: ${EXISTING_LABELS:-None}
+
+            **Changed Files** (${{ steps.pr_details.outputs.file_count }} files):
+            ${FILES_INFO}
+
+            **Available Repository Labels** (${{ steps.fetch_labels.outputs.label_count }} labels):
+            ${LABELS_INFO}
+
+            **Instructions:**
+            1. Analyze the PR title, description, and changed files
+            2. Select the most relevant labels from the available labels list above
+            3. Consider the label descriptions to ensure accurate categorization
+            4. You can suggest multiple labels if appropriate
+            5. CRITICAL: You MUST ONLY select labels that exist in the 'Available Repository Labels' list above
+            6. CRITICAL: Do NOT invent, create, or suggest any labels that are not in the available labels list
+            7. IMPORTANT: Do NOT suggest the 'fix-with-bob' label - it is reserved for other workflows
+            8. Output ONLY the label names, one per line, nothing else
+            9. If no labels from the available list are appropriate, output 'NONE'
+
+            **Output Format:**
+            label-name-1
+            label-name-2
+            label-name-3
+
+            Suggested labels:"
+
+            BOB_OUTPUT=$(bob --accept-license -p "${PROMPT}" 2>&1)
+
+            echo "Bob Shell output:"
+            echo "${BOB_OUTPUT}"
+
+            VALID_LABELS=$(cat /tmp/labels_info.txt | grep -oP '(?<=\*\*)[^*]+(?=\*\*)' | grep -v "^fix-with-bob$")
+
+            RAW_SUGGESTIONS=$(echo "${BOB_OUTPUT}" | grep -v "^$" | tail -n 20 | grep -E "^[a-z0-9-]+$" || echo "")
+
+            VALIDATED_LABELS=""
+            INVALID_LABELS=""
+
+            if [ -n "${RAW_SUGGESTIONS}" ] && [ "${RAW_SUGGESTIONS}" != "NONE" ]; then
+              while IFS= read -r label; do
+                if [ -n "${label}" ]; then
+                  if echo "${VALID_LABELS}" | grep -qx "${label}"; then
+                    if [ -z "${VALIDATED_LABELS}" ]; then
+                      VALIDATED_LABELS="${label}"
+                    else
+                      VALIDATED_LABELS="${VALIDATED_LABELS}"$'\n'"${label}"
+                    fi
+                  else
+                    if [ -z "${INVALID_LABELS}" ]; then
+                      INVALID_LABELS="${label}"
+                    else
+                      INVALID_LABELS="${INVALID_LABELS}, ${label}"
+                    fi
+                  fi
+                fi
+              done <<< "${RAW_SUGGESTIONS}"
+            fi
+
+            if [ -n "${INVALID_LABELS}" ]; then
+              echo "⚠️ Warning: Bob suggested invalid labels not in repository: ${INVALID_LABELS}"
+            fi
+
+            if [ -z "${VALIDATED_LABELS}" ]; then
+              echo "No valid labels suggested by Bob Shell"
+              echo "suggested_labels=" >> $GITHUB_OUTPUT
+            else
+              echo "Validated labels:"
+              echo "${VALIDATED_LABELS}"
+              LABELS_CSV=$(echo "${VALIDATED_LABELS}" | tr '\n' ',' | sed 's/,$//')
+              echo "suggested_labels=${LABELS_CSV}" >> $GITHUB_OUTPUT
+            fi
+        env:
+          BOBSHELL_API_KEY: ${{ secrets.BOBSHELL_API_KEY }}
+
+      - name: Apply Labels to PR
+        if: steps.suggest_labels.outputs.suggested_labels != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.get_pr.outputs.pr_number }}"
+          SUGGESTED_LABELS="${{ steps.suggest_labels.outputs.suggested_labels }}"
+
+          if [ -z "${SUGGESTED_LABELS}" ]; then
+            echo "No labels to apply"
+            exit 0
+          fi
+
+          echo "Applying labels to PR #${PR_NUMBER}: ${SUGGESTED_LABELS}"
+
+          IFS=',' read -ra LABELS_ARRAY <<< "${SUGGESTED_LABELS}"
+
+          for LABEL in "${LABELS_ARRAY[@]}"; do
+            LABEL=$(echo "${LABEL}" | xargs)
+
+            if [ -n "${LABEL}" ] && [ "${LABEL}" != "fix-with-bob" ]; then
+              echo "Adding label: ${LABEL}"
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+                -f labels[]="${LABEL}" || echo "Failed to add label: ${LABEL}"
+            fi
+          done
+
+          echo "Labels applied successfully"
+
+      - name: Comment on PR
+        if: steps.suggest_labels.outputs.suggested_labels != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.get_pr.outputs.pr_number }}"
+          SUGGESTED_LABELS="${{ steps.suggest_labels.outputs.suggested_labels }}"
+
+          LABELS_DISPLAY=$(echo "${SUGGESTED_LABELS}" | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/' | tr '\n' ' ')
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="🏷️ **Automatic Labeling**
+
+          I've analyzed this pull request and added the following labels:
+
+          ${LABELS_DISPLAY}
+
+          These labels were selected based on the PR title, description, and changed files. If you believe any labels are incorrect or missing, feel free to adjust them manually." || echo "Failed to post comment"
+
+      - name: Comment on PR - No Labels
+        if: steps.suggest_labels.outputs.suggested_labels == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.get_pr.outputs.pr_number }}"
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="🏷️ **Automatic Labeling**
+
+          I've analyzed this pull request but couldn't determine appropriate labels automatically. Please add labels manually if needed." || echo "Failed to post comment"
+
+      - name: Handle Errors
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.get_pr.outputs.pr_number }}"
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="❌ **Automatic Labeling Failed**
+
+          An error occurred while trying to automatically label this pull request. Please check the workflow logs for details and add labels manually." || echo "Failed to post error comment"
+
+# Made with Bob
