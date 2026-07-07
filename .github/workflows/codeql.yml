@@ -7,7 +7,8 @@
 # Called via workflow_call from each repo's thin caller workflow.
 #
 # INPUTS:
-#   languages: comma-separated CodeQL language names (default: python,javascript)
+#   languages: JSON array string of CodeQL language names
+#              default: '["python","javascript"]'
 #
 # USAGE (in caller repo):
 #   jobs:
@@ -15,7 +16,7 @@
 #       uses: skillberry-ai/skillberry-common/.github/workflows/codeql.yml@main
 #       secrets: inherit
 #       with:
-#         languages: python,javascript
+#         languages: '["python","javascript"]'
 # ============================================================================
 
 name: CodeQL (shared)
@@ -24,9 +25,9 @@ on:
   workflow_call:
     inputs:
       languages:
-        description: 'Comma-separated CodeQL language names to analyze'
+        description: 'JSON array string of CodeQL language names, e.g. ''["python","javascript"]'''
         type: string
-        default: 'python,javascript'
+        default: '["python","javascript"]'
 
 jobs:
   analyze:
@@ -40,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ${{ fromJson(format('[{0}]', join(split(inputs.languages, ','), ','))) }}
+        language: ${{ fromJson(inputs.languages) }}
 
     steps:
       - name: Checkout repository
