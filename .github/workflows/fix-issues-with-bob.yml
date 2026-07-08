@@ -198,9 +198,10 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
         run: |
           # Use the repo's actual default branch, not a hardcoded 'main'
-          DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          DEFAULT_BRANCH=$(gh api "repos/${GH_REPOSITORY}" --jq '.default_branch')
 
           DIFF_STATS=$(git diff "origin/${DEFAULT_BRANCH}...HEAD" --stat || echo "Unable to generate diff stats")
 
@@ -227,7 +228,7 @@ jobs:
           fi
 
           PR_URL=$(gh pr create \
-            --repo ${{ github.repository }} \
+            --repo "${GH_REPOSITORY}" \
             --title "Fix: Issue #${{ steps.issue.outputs.issue_number }} - ${{ steps.issue.outputs.issue_title }}" \
             --body "${PR_BODY}" \
             --base "${DEFAULT_BRANCH}" \
@@ -238,7 +239,7 @@ jobs:
           PR_NUMBER=$(echo "${PR_URL}" | grep -oP '\d+$')
           echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_ENV
 
-          gh pr edit "${PR_NUMBER}" --repo ${{ github.repository }} --add-label "fix-with-bob"
+          gh pr edit "${PR_NUMBER}" --repo "${GH_REPOSITORY}" --add-label "fix-with-bob"
           echo "✓ Added 'fix-with-bob' label to PR #${PR_NUMBER}"
 
       - name: Comment on Issue
