@@ -13,8 +13,6 @@ OS := $(shell uname -s)
 # Location of private SSH key for git+ssh dependencies, e.g., during docker build
 SSH_KEY ?= ~/.ssh/id_rsa 2>/dev/null
 
-LLM_SVCS_ENV_VARS := RITS_API_KEY WATSONX_APIKEY WATSONX_PROJECT_ID WATSONX_URL
-
 .DEFAULT:	# Any unimplemented target or dependency will fail here
 	@echo "Unimplemented target: $@"
 	@false
@@ -109,27 +107,6 @@ print_build_version:
 .PHONY: check-venv
 check-venv:
 	@python -c "import sys, os; in_venv = ('VIRTUAL_ENV' in os.environ) or (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)); print('✅ In virtual environment' if in_venv else '❌ Not in virtual environment'); exit(0) if in_venv else exit(1)"
-
-.PHONY: check_rits_key
-check_rits_key:
-	@if [ -z $$RITS_API_KEY ]; then echo "RITS_API_KEY is not set. It is required for the agent service"; exit 1; fi
-
-.PHONY: check-rits-watsonx-envs
-check-rits-watsonx-envs:
-	@missing_vars=""; \
-	if [ -z "$$RITS_API_KEY" ]; then \
-		if [ -z "$$WATSONX_APIKEY" ]; then missing_vars="$$missing_vars WATSONX_APIKEY"; fi; \
-		if [ -z "$$WATSONX_PROJECT_ID" ]; then missing_vars="$$missing_vars WATSONX_PROJECT_ID"; fi; \
-		if [ -z "$$WATSONX_URL" ]; then missing_vars="$$missing_vars WATSONX_URL"; fi; \
-		if [ -n "$$missing_vars" ]; then \
-			echo "Missing required environment variables: RITS_API_KEY or ($$missing_vars)"; \
-			exit 1; \
-		else \
-			echo "All WATSONX_* variables are set. Proceeding..."; \
-		fi; \
-	else \
-		echo "RITS_API_KEY is set. Proceeding..."; \
-	fi
 
 .PHONY: ssh-agent
 ssh-agent: .stamps/ssh-agent.env

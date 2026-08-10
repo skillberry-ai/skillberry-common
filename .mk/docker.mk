@@ -295,17 +295,7 @@ else
 endif
 
 .PHONY: docker-run
-ifeq ($(USE_LLM_SVCS),1)
-docker-run: docker-check docker-get docker-clean check-rits-watsonx-envs ## Run the docker container (pull or build first if needed)
-	@$(SB_COMMON_PATH)/scripts/update_env_vars.sh -r .env $(LLM_SVCS_ENV_VARS)
-	$(DOCKER) run --name $(CNTR_NAME) --env-file .env \
-		-d \
-		$(VOLUME_FLAGS) \
-		--network=host \
-		$(FULL_IMAGE_NAME):$(IMAGE_TAG)
-	@echo "Docker container started: $(CNTR_NAME)"
-else
-docker-run: docker-check docker-get docker-clean
+docker-run: docker-check docker-get docker-clean ## Run the docker container (pull or build first if needed)
 	@test -f .env || touch .env
 	$(DOCKER) run --name $(CNTR_NAME) --env-file .env \
 		-d \
@@ -313,7 +303,6 @@ docker-run: docker-check docker-get docker-clean
 		--network=host \
 		$(FULL_IMAGE_NAME):$(IMAGE_TAG)
 	@echo "Docker container started: $(CNTR_NAME)"
-endif
 
 .PHONY: docker-rmi
 docker-rmi: docker-check docker-clean ## Remove the docker container, image, and temporary files
