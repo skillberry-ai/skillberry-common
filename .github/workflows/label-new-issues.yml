@@ -134,12 +134,13 @@ jobs:
             # NOTE: heredoc terminator is intentionally unquoted (<< PROMPT_EOF, not
             # << 'PROMPT_EOF') so bash performs the $VAR substitutions below itself.
             # issue_number/issue_title/issue_body/labels_list are passed via env: and
-            # referenced as $VAR rather than spliced in via ${{ }}, because GitHub
-            # Actions substitutes ${{ }} into the script's source text before bash
-            # ever parses it — a quoted heredoc does not stop that. An issue body
-            # containing a line that is exactly "PROMPT_EOF" would otherwise
-            # terminate the heredoc early and the rest of the issue body would
-            # execute as real shell commands in this job.
+            # referenced as $VAR rather than spliced in via a double-brace GitHub
+            # Actions expression, because GitHub Actions substitutes those
+            # expressions into the script's source text before bash ever parses
+            # it - a quoted heredoc does not stop that. An issue body containing
+            # a line that is exactly "PROMPT_EOF" would otherwise terminate the
+            # heredoc early and the rest of the issue body would execute as real
+            # shell commands in this job.
             cat > /tmp/labeling_prompt.txt << PROMPT_EOF
             You are analyzing a GitHub issue to select appropriate labels.
 
