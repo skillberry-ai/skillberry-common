@@ -44,7 +44,11 @@ jobs:
       - name: Install Bob Shell
         run: |
           echo "Installing Bob Shell..."
-          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm
+          # Pinned to 1.0.6: Bob Shell 2.x hangs indefinitely on non-interactive
+          # `bob --accept-license -p ...` invocations (no TTY on GitHub-hosted
+          # runners), which broke every automated labeling run since 2026-08-06.
+          # Revisit the pin once 2.x's non-interactive mode is confirmed fixed.
+          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm --version 1.0.6
 
           # Verify installation
           if command -v bob &> /dev/null; then
