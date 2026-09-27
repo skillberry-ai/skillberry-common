@@ -175,7 +175,11 @@ jobs:
       - name: Install Bob Shell
         run: |
           echo "Installing Bob Shell..."
-          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm
+          # Pinned to 1.0.6: Bob Shell 2.x hangs indefinitely on non-interactive
+          # `bob --accept-license -p ...` invocations (no TTY on GitHub-hosted
+          # runners), which broke every automated labeling run since 2026-08-06.
+          # Revisit the pin once 2.x's non-interactive mode is confirmed fixed.
+          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm --version 1.0.6
 
           if command -v bob &> /dev/null; then
             echo "Bob Shell installed successfully"
@@ -207,25 +211,20 @@ jobs:
             LABELS_INFO=$(cat /tmp/labels_info.txt)
             FILES_INFO=$(cat /tmp/files_info.txt)
 
-            PR_TITLE="${{ steps.get_pr.outputs.pr_title }}"
-            PR_BODY="${{ steps.get_pr.outputs.pr_body }}"
-            PR_AUTHOR="${{ steps.get_pr.outputs.pr_author }}"
-            EXISTING_LABELS="${{ steps.pr_details.outputs.existing_labels }}"
-
             PROMPT="Analyze this pull request and suggest relevant labels from the available repository labels.
 
             **Pull Request Information:**
-            - **Number**: #${{ steps.get_pr.outputs.pr_number }}
+            - **Number**: #${PR_NUMBER}
             - **Title**: ${PR_TITLE}
             - **Author**: @${PR_AUTHOR}
             - **Description**: ${PR_BODY}
 
             **Existing Labels**: ${EXISTING_LABELS:-None}
 
-            **Changed Files** (${{ steps.pr_details.outputs.file_count }} files):
+            **Changed Files** (${FILE_COUNT} files):
             ${FILES_INFO}
 
-            **Available Repository Labels** (${{ steps.fetch_labels.outputs.label_count }} labels):
+            **Available Repository Labels** (${LABEL_COUNT} labels):
             ${LABELS_INFO}
 
             **Instructions:**
@@ -293,6 +292,17 @@ jobs:
             fi
         env:
           BOBSHELL_API_KEY: ${{ secrets.BOBSHELL_API_KEY }}
+          # Passed as env vars (not interpolated into the script text) because
+          # pr_title/pr_body/existing_labels come from untrusted PR content and
+          # can contain quotes/backticks/$() that would otherwise break out of
+          # the PROMPT="..." string and execute as shell commands.
+          PR_NUMBER: ${{ steps.get_pr.outputs.pr_number }}
+          PR_TITLE: ${{ steps.get_pr.outputs.pr_title }}
+          PR_BODY: ${{ steps.get_pr.outputs.pr_body }}
+          PR_AUTHOR: ${{ steps.get_pr.outputs.pr_author }}
+          EXISTING_LABELS: ${{ steps.pr_details.outputs.existing_labels }}
+          FILE_COUNT: ${{ steps.pr_details.outputs.file_count }}
+          LABEL_COUNT: ${{ steps.fetch_labels.outputs.label_count }}
 
       - name: Apply Labels to PR
         if: steps.suggest_labels.outputs.suggested_labels != ''
