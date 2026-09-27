@@ -263,7 +263,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "Installing Bob Shell..."
-          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm
+          # Pinned to 1.0.6: Bob Shell 2.x hangs indefinitely on non-interactive
+          # `bob --accept-license -p ...` invocations (no TTY on GitHub-hosted
+          # runners). Revisit the pin once 2.x's non-interactive mode is
+          # confirmed fixed.
+          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm --version 1.0.6
 
           if command -v bob &> /dev/null; then
             echo "Bob Shell installed successfully"
@@ -349,12 +353,19 @@ jobs:
 
             Pull request metadata:
             PROMPT
-              echo "PR number: #${{ steps.pr.outputs.pr_number }}"
-              echo "PR title: ${{ steps.pr.outputs.pr_title }}"
-              echo "PR URL: ${{ steps.pr.outputs.pr_url }}"
-              echo "Head repo: ${{ steps.pr.outputs.head_repo }}"
-              echo "Head ref: ${{ steps.pr.outputs.head_ref }}"
-              echo "Base ref: ${{ steps.pr.outputs.base_ref }}"
+              # PR_NUMBER/PR_TITLE/etc. come from env: below and are
+              # referenced as $VAR rather than spliced in with a double-brace
+              # GitHub Actions expression, since pr_title/pr_url/etc. are
+              # attacker-controlled PR content: GitHub Actions substitutes
+              # those expressions into this script's source text before bash
+              # ever parses it, so a stray quote/backtick/$() in the PR title
+              # would otherwise execute as shell in this job.
+              echo "PR number: #${PR_NUMBER}"
+              echo "PR title: ${PR_TITLE}"
+              echo "PR URL: ${PR_URL}"
+              echo "Head repo: ${HEAD_REPO}"
+              echo "Head ref: ${HEAD_REF}"
+              echo "Base ref: ${BASE_REF}"
               echo "Detected project directory: ${PROJECT_DIR:-none}"
               echo
               echo "PR body:"
@@ -374,6 +385,12 @@ jobs:
         env:
           BOBSHELL_API_KEY: ${{ secrets.BOBSHELL_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_TITLE: ${{ steps.pr.outputs.pr_title }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
 
       - name: Capture generated test files (no commit/push)
         if: steps.pr.outputs.should_run == 'true'
