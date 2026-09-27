@@ -131,16 +131,25 @@ jobs:
           retry_wait_seconds: 10
           command: |
             # Create a comprehensive prompt for Bob Shell
-            cat > /tmp/labeling_prompt.txt << 'PROMPT_EOF'
+            # NOTE: heredoc terminator is intentionally unquoted (<< PROMPT_EOF, not
+            # << 'PROMPT_EOF') so bash performs the $VAR substitutions below itself.
+            # issue_number/issue_title/issue_body/labels_list are passed via env: and
+            # referenced as $VAR rather than spliced in via ${{ }}, because GitHub
+            # Actions substitutes ${{ }} into the script's source text before bash
+            # ever parses it — a quoted heredoc does not stop that. An issue body
+            # containing a line that is exactly "PROMPT_EOF" would otherwise
+            # terminate the heredoc early and the rest of the issue body would
+            # execute as real shell commands in this job.
+            cat > /tmp/labeling_prompt.txt << PROMPT_EOF
             You are analyzing a GitHub issue to select appropriate labels.
 
-            ISSUE #${{ steps.issue.outputs.issue_number }}: ${{ steps.issue.outputs.issue_title }}
+            ISSUE #${ISSUE_NUMBER}: ${ISSUE_TITLE}
 
             ISSUE DESCRIPTION:
-            ${{ steps.issue.outputs.issue_body }}
+            ${ISSUE_BODY}
 
             AVAILABLE LABELS:
-            ${{ steps.labels.outputs.labels_list }}
+            ${LABELS_LIST}
 
             TASK:
             Analyze the issue and select the most appropriate labels from the available labels list.
@@ -243,6 +252,14 @@ jobs:
             echo "${VALIDATED_LABELS}" > /tmp/selected_labels.json
         env:
           BOBSHELL_API_KEY: ${{ secrets.BOBSHELL_API_KEY }}
+          # Passed as env vars (not interpolated into the heredoc text) because
+          # issue_title/issue_body/labels_list come from untrusted issue content
+          # and would otherwise let a crafted issue body break out of the
+          # heredoc and execute as shell — see the NOTE above the heredoc.
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.issue_title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.issue_body }}
+          LABELS_LIST: ${{ steps.labels.outputs.labels_list }}
 
       - name: Apply Labels to Issue
         env:
