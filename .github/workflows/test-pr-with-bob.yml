@@ -51,9 +51,13 @@ permissions:
   issues: write
   pull-requests: write
 
-concurrency:
-  group: test-pr-with-bob-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
-  cancel-in-progress: true
+# No concurrency: block here on purpose. Every caller of this reusable workflow
+# (cap-evolve, skillberry-store) already declares its own concurrency group with
+# the same expression. A workflow_call caller and its called reusable workflow
+# sharing one concurrency group causes GitHub Actions to detect a deadlock (the
+# caller run holds the group while waiting on this job, but this job needs the
+# same group to start) and auto-cancel every single run with zero jobs ever
+# starting - which is exactly what was happening here before this fix.
 
 jobs:
   test-pr-with-bob:
@@ -252,6 +256,61 @@ jobs:
           echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
           echo "PROJECT_DIR=${PROJECT_DIR}" >> "$GITHUB_ENV"
 
+      - name: Bootstrap Playwright config if missing
+        if: steps.pr.outputs.should_run == 'true'
+        id: playwright_bootstrap
+        env:
+          PROJECT_DIR: ${{ steps.project_dir.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PROJECT_DIR}" ] || [ ! -f "${PROJECT_DIR}/package.json" ]; then
+            echo "No detected Node project; nothing to bootstrap."
+            echo "test_dir=tests/e2e" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # This project genuinely has no Playwright config at all (confirmed for
+          # cap-evolve's dashboard/frontend - no @playwright/test dependency, no
+          # playwright.config.*, no e2e directory), so the "visual proof" steps
+          # further down always skipped and silently reported success with zero
+          # screenshots. Bootstrap a minimal config here (before Bob writes any
+          # tests) so there is always somewhere for UI proof to land, whether or
+          # not a given project already had e2e infra configured. If a config
+          # already exists (e.g. skillberry-store's UI), leave it untouched.
+          EXISTING_CONFIG=$(find "${PROJECT_DIR}" -maxdepth 1 \
+            \( -name 'playwright.config.*' -o -name '*playwright*.config.*' \) \
+            -print -quit 2>/dev/null || true)
+
+          if [ -n "${EXISTING_CONFIG}" ]; then
+            echo "Playwright config already exists at ${EXISTING_CONFIG}; leaving it as-is."
+            echo "test_dir=tests/e2e" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "No Playwright config found in ${PROJECT_DIR}; bootstrapping a minimal one."
+          mkdir -p "${PROJECT_DIR}/tests/e2e"
+
+          cat > "${PROJECT_DIR}/playwright.config.ts" <<'TS'
+          import { defineConfig } from '@playwright/test';
+
+          // Bootstrapped by the "Test PR with Bob" workflow because this project
+          // had no Playwright setup yet. CI-specific overrides (reporters, output
+          // dirs, trace/video/screenshot capture) are layered on top of this via
+          // playwright.bob-ci.config.ts, generated later in the "Run Playwright UI
+          // tests" step - edit this file freely for anything beyond that.
+          export default defineConfig({
+            testDir: './tests/e2e',
+            fullyParallel: true,
+            use: {
+              baseURL: process.env.BOB_UI_BASE_URL || 'http://127.0.0.1:8002',
+            },
+          });
+          TS
+
+          echo "Bootstrapped playwright.config.ts and tests/e2e/ in ${PROJECT_DIR}"
+          echo "test_dir=tests/e2e" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node.js
         if: steps.pr.outputs.should_run == 'true'
         uses: actions/setup-node@v4
@@ -330,6 +389,10 @@ jobs:
             - Do not rewrite unrelated production code.
             - Only change production code if a small testability fix is strictly required.
             - If the PR changes UI behavior, create or update Playwright tests with @playwright/test.
+              Place new Playwright spec files under the project's tests/e2e/ directory
+              (reported below as "Playwright testDir") so they are picked up by the
+              existing/bootstrapped playwright.config.ts - a config already exists or
+              was just created there for you.
             - Use the configured Playwright MCP server in .mcp.json to inspect UI behavior where helpful.
             - For UI behavior, make the tests produce proof that a reviewer can inspect:
               - screenshots for important before/after or final UI states of the CHANGED feature,
@@ -367,6 +430,7 @@ jobs:
               echo "Head ref: ${HEAD_REF}"
               echo "Base ref: ${BASE_REF}"
               echo "Detected project directory: ${PROJECT_DIR:-none}"
+              echo "Playwright testDir: ${PROJECT_DIR:-none}/${TEST_DIR}"
               echo
               echo "PR body:"
               cat "${ARTIFACT_DIR}/pr-body.md" 2>/dev/null || true
@@ -391,6 +455,7 @@ jobs:
           HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
           BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          TEST_DIR: ${{ steps.playwright_bootstrap.outputs.test_dir }}
 
       - name: Capture generated test files (no commit/push)
         if: steps.pr.outputs.should_run == 'true'
@@ -475,6 +540,53 @@ jobs:
           echo "package_manager=${PACKAGE_MANAGER}" >> "$GITHUB_OUTPUT"
           echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
           echo "install_exit_code=${INSTALL_EXIT}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Ensure Playwright is installed
+        if: steps.pr.outputs.should_run == 'true'
+        id: playwright_install
+        env:
+          PACKAGE_MANAGER: ${{ steps.install_deps.outputs.package_manager }}
+          PROJECT_DIR: ${{ steps.install_deps.outputs.project_dir }}
+        run: |
+          set +e
+          PW_DEP_EXIT=0
+
+          mkdir -p "${ARTIFACT_DIR}/logs"
+
+          if [ -z "${PROJECT_DIR}" ] || [ "${PACKAGE_MANAGER}" = "none" ]; then
+            echo "No detected Node project; nothing to install." | tee "${ARTIFACT_DIR}/logs/playwright-install.log"
+            echo "playwright_install_exit_code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pushd "${PROJECT_DIR}" > /dev/null
+
+          # The "Bootstrap Playwright config if missing" step earlier may have
+          # created a playwright.config.ts, or one may already exist (e.g.
+          # skillberry-store's UI). Either way, make sure @playwright/test is
+          # actually installed before the "Run Playwright UI tests" step tries
+          # to use it - that step calls `npx --no-install playwright`, which
+          # fails outright rather than auto-installing.
+          HAS_PW_DEP=$(jq -r '((.dependencies["@playwright/test"] // "") + (.devDependencies["@playwright/test"] // ""))' package.json 2>/dev/null)
+
+          if [ -n "${HAS_PW_DEP}" ]; then
+            echo "@playwright/test is already a dependency." | tee "${ARTIFACT_DIR}/logs/playwright-install.log"
+          else
+            echo "@playwright/test not found in package.json; installing it." | tee "${ARTIFACT_DIR}/logs/playwright-install.log"
+            if [ "${PACKAGE_MANAGER}" = "pnpm" ]; then
+              pnpm add -D @playwright/test >> "${ARTIFACT_DIR}/logs/playwright-install.log" 2>&1
+            elif [ "${PACKAGE_MANAGER}" = "yarn" ]; then
+              yarn add -D @playwright/test >> "${ARTIFACT_DIR}/logs/playwright-install.log" 2>&1
+            else
+              npm install --save-dev @playwright/test >> "${ARTIFACT_DIR}/logs/playwright-install.log" 2>&1
+            fi
+            PW_DEP_EXIT=$?
+          fi
+
+          popd > /dev/null
+
+          echo "playwright_install_exit_code=${PW_DEP_EXIT}" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Run project test suite
