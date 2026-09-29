@@ -7,8 +7,13 @@
 # labeled with 'fix-with-bob', this workflow:
 # 1. Collects the issue title, body and human comments into a task file
 # 2. Runs Bob Shell once to plan and implement the WHOLE issue
-# 3. Runs the caller's verify command, then gives Bob more passes to fix
-#    failures and to implement any issue requirement it has not covered yet
+# 3. Runs the caller's verify command (plus an optional "source changes need
+#    test changes" rule), then gives Bob more passes. Each pass gets NEXT.md:
+#    the failed checks and the open `- [ ]` items of Bob's PLAN.md. The loop
+#    ends when checks pass and no item is open, or after two passes in a row
+#    that change no source file.
+#    When an open PR for the issue already exists, the run continues from its
+#    branch and gives Bob its description, so earlier work is kept.
 # 4. Pushes changes to a branch in the skillberry-bot fork of the calling repo
 # 5. Creates (or updates) a pull request whose body is Bob's own summary:
 #    requirement checklist, commands run, verification result
@@ -40,6 +45,8 @@
 #         python_version: '3.11'
 #         setup_command: pip install -e ./core[dev]
 #         verify_command: python -m pytest -q
+#         code_paths: '^src/'
+#         test_paths: '^tests/'
 # ============================================================================
 
 name: Fix Issues with Bob (shared)
@@ -64,9 +71,17 @@ on:
         type: number
         default: 60
       refine_passes:
-        description: "Maximum number of extra Bob passes that fix verify failures and fill requirement gaps."
+        description: "Maximum number of extra Bob passes that fix verify failures and implement the open checklist items."
         type: number
         default: 2
+      code_paths:
+        description: "Extended regex for source files that need tests. When a changed file matches it and no changed file matches test_paths, verification fails. Empty = no check."
+        type: string
+        default: ''
+      test_paths:
+        description: "Extended regex for test files, used with code_paths."
+        type: string
+        default: ''
 
 jobs:
   fix-issues-with-bob:
@@ -183,10 +198,44 @@ jobs:
       - name: Create Branch for Fix
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+          GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           BRANCH_NAME="fix-issue-${ISSUE_NUMBER}"
-          git checkout -b "${BRANCH_NAME}"
           echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
+
+          # When an open PR for this issue already exists (an earlier run), continue
+          # from its branch so the work it has is kept, and give Bob its checklist.
+          # To start over instead, close that PR before re-adding the label.
+          PREV=$(gh pr list --repo "${GH_REPOSITORY}" --state open --head "${BRANCH_NAME}" \
+            --json number,headRepositoryOwner,headRepository,body \
+            --jq '.[0] // empty')
+          if [ -n "${PREV}" ]; then
+            PREV_NUMBER=$(jq -r '.number' <<< "${PREV}")
+            HEAD_REPO="$(jq -r '.headRepositoryOwner.login' <<< "${PREV}")/$(jq -r '.headRepository.name' <<< "${PREV}")"
+            echo "Open PR #${PREV_NUMBER} found on ${HEAD_REPO}:${BRANCH_NAME}; continuing from it"
+            git fetch -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${HEAD_REPO}.git" "${BRANCH_NAME}"
+            git checkout -q -b "${BRANCH_NAME}" FETCH_HEAD
+            # Bring in newer main; on a conflict keep the branch as it is.
+            if ! git merge -q --no-edit "origin/${DEFAULT_BRANCH}"; then
+              git merge --abort
+              echo "::warning::could not merge ${DEFAULT_BRANCH} into ${BRANCH_NAME}; continuing without it"
+            fi
+            {
+              echo "# Earlier work on this issue"
+              echo
+              echo "This branch already has commits from an earlier run of this workflow"
+              echo "(PR #${PREV_NUMBER}). See them with \`git log origin/${DEFAULT_BRANCH}..HEAD\`"
+              echo "and \`git diff origin/${DEFAULT_BRANCH}...HEAD\`. Keep the work that is"
+              echo "correct and finish everything that is not done. The earlier PR"
+              echo "description, with its checklist, follows."
+              echo
+              jq -r '.body // ""' <<< "${PREV}"
+            } > "${BOB_OUT}/PREVIOUS_PR.md"
+          else
+            git checkout -b "${BRANCH_NAME}"
+          fi
 
       - name: Install repository dependencies
         if: inputs.setup_command != ''
@@ -202,11 +251,13 @@ jobs:
           ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
           REPOSITORY: ${{ github.repository }}
           VERIFY_COMMAND: ${{ inputs.verify_command }}
+          REFINE_PASSES: ${{ inputs.refine_passes }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
           # The issue text is NOT spliced into these prompts. Bob reads it from
           # ISSUE.md, so issue text can never change the shell script or the
           # structure of the instructions below.
-          # Heredoc terminators are quoted: no expansion inside, except the two
+          # Heredoc terminators are quoted: no expansion inside, except the
           # variables that envsubst fills afterwards.
           cat > "${BOB_OUT}/PROMPT_IMPLEMENT.md" <<'PROMPT_EOF'
           You are resolving GitHub issue #${ISSUE_NUMBER} in the repository ${REPOSITORY}.
@@ -214,9 +265,26 @@ jobs:
           leaves something open, choose the option that fits the existing code
           best, and record the decision.
 
+          ## You must finish the whole issue
+          - Your job is to deliver EVERYTHING the issue asks for, in this one pull
+            request. Nobody will do the rest later.
+          - The size of the issue is NOT a reason to stop, to do "phase 1 only", or
+            to leave work for a follow-up PR. If the issue has a "suggested PR
+            order" or phases, that is the ORDER in which you work. It is not a
+            point where you stop.
+          - You have this pass (at most ${TIMEOUT_MINUTES} minutes) and up to
+            ${REFINE_PASSES} more passes of the same length. Each pass continues
+            from the files you left. Work until every checklist item is done or
+            your time runs out. Never end a pass early while items are open.
+          - Do not write progress reports, time estimates or "what a later PR
+            should do". Write code. Write the summary files only at the end of a
+            pass, in a few minutes.
+
           ## Read first
           - `.bob/out/ISSUE.md`: the issue title, body and comments from people.
             This file is the task description.
+          - `.bob/out/PREVIOUS_PR.md`, if it exists: an earlier run already did
+            part of the work on this branch. Continue from it; do not redo it.
           - Repository guidance, when present: `.bob/rules/`, `AGENTS.md`,
             `CLAUDE.md`, `CONTRIBUTING.md`, `README.md`.
           - `.github/workflows/`: shows how this repository is installed, tested
@@ -224,13 +292,12 @@ jobs:
           - If the working tree already has changes (`git status`), an earlier
             attempt was interrupted. Continue from those changes; do not start over.
 
-          ## Definition of done
-          1. Before you edit code, turn the issue into a numbered checklist of
-             concrete requirements and write it to `.bob/out/PLAN.md`. Include every
-             deliverable the issue asks for: backend, frontend / UI, data model,
-             docs and tests. If the issue lists phases or a "suggested PR order",
-             the checklist covers ALL of them, unless the issue or a comment
-             explicitly limits this change to some of them.
+          ## How to work
+          1. Before you edit code, turn the issue into a checklist of concrete
+             requirements in `.bob/out/PLAN.md` (if it exists, update it). Use one
+             line per item, `- [ ] <item>` when open and `- [x] <item>` when done.
+             The workflow reads these lines to pick your next task. Include every
+             deliverable: backend, frontend / UI, data model, docs and tests.
           2. If the issue links a prototype, proof of concept, mockup, screenshot,
              gist, design or example file, download it into `.bob/out/refs/` (use
              web_fetch, or `curl -L` in the shell; for a gist use
@@ -239,22 +306,27 @@ jobs:
              the views, interactions and layout of that reference, built with the
              repository's existing components, styles and theme tokens. A
              backend-only change does not resolve a UI issue.
-          3. Implement the checklist item by item. Match the style, naming and
-             comment density of the surrounding code. Do not stop after the first
-             item because it looks like a natural first PR.
-          4. Add or update tests for each new behavior. Run every test, lint and
-             build command that covers the files you changed, and fix the failures.
-             Never leave a test that you did not run, or that fails. If the
-             repository commits build output (for example a `dist/` folder),
-             rebuild it with the repository's build command.
-          5. Write `.bob/out/PR_SUMMARY.md` in Markdown, for the reviewer:
+          3. For a UI issue, make every view visible and reachable early, even in a
+             simple first version, then improve each one. A finished backend with
+             no UI is the worst result.
+          4. Implement the checklist item by item. Match the style, naming and
+             comment density of the surrounding code.
+          5. Every new function, data field and UI component needs a new test in
+             the repository's test folders. The workflow fails the change when
+             source files change and no test file does. Run the tests and builds
+             for the files you changed, and fix the failures. Never leave a test
+             that you did not run, or that fails. If the repository commits build
+             output (for example a `dist/` folder), rebuild it with the
+             repository's build command.
+          6. At the end of the pass, write `.bob/out/PR_SUMMARY.md` in Markdown,
+             for the reviewer:
              - `## Summary`: what changed, grouped by area (a few bullets each).
-             - `## Requirements`: the checklist from PLAN.md, each line `- [x]`
-               (done) or `- [ ]` (not done, with the reason).
+             - `## Requirements`: the checklist from PLAN.md with `- [x]` / `- [ ]`.
              - `## Decisions`: how you answered open questions in the issue.
              - `## Verification`: each command you ran and its result.
-          6. Write one word to `.bob/out/STATUS`: `COMPLETE` if every checklist item
-             is done and all tests pass, otherwise `INCOMPLETE`.
+          7. Write `.bob/out/STATUS`. It must contain exactly one word and nothing
+             else: `COMPLETE` if every checklist item is done and all tests pass,
+             otherwise `INCOMPLETE`. Put explanations in PR_SUMMARY.md, not here.
 
           ## Rules
           - Do not commit, push, create branches or open pull requests. The
@@ -268,34 +340,36 @@ jobs:
 
           cat > "${BOB_OUT}/PROMPT_REFINE.md" <<'PROMPT_EOF'
           You are continuing work on GitHub issue #${ISSUE_NUMBER} in the repository
-          ${REPOSITORY}. An earlier pass already changed the working tree: inspect it
-          with `git status` and `git diff`. The rules and the definition of done
-          in `.bob/out/PROMPT_IMPLEMENT.md` still apply. Read it, then read
-          `.bob/out/ISSUE.md`, `.bob/out/PLAN.md` and `.bob/out/PR_SUMMARY.md`.
+          ${REPOSITORY}. Earlier passes already changed the working tree. All rules
+          in `.bob/out/PROMPT_IMPLEMENT.md` still apply, above all "You must finish
+          the whole issue". Read it first.
 
-          Verification: `.bob/out/verify.log` holds the output of the repository's
-          verify command (the command is in `.bob/out/verify_command.txt`). Its
-          last line is the exit code. If the
-          file says "no verify command configured", run the relevant tests
-          yourself.
+          Your task in this pass is in `.bob/out/NEXT.md`. It lists:
+          - the checks that failed after the last pass, if any, and
+          - the checklist items in `.bob/out/PLAN.md` that are still open.
 
           Do this, in order:
-          1. Fix every failure in the verification output. Fix the code, not the
-             test, unless the test itself is wrong.
-          2. Compare the diff against every requirement in ISSUE.md, not only the
-             checklist in PLAN.md (the checklist may have missed items). For each
-             requirement that is missing or only partly done, implement it now.
-             Pay special attention to UI work and to anything a linked prototype
-             shows.
-          3. Run the tests again.
+          1. Fix every failure listed in NEXT.md. The full output of the checks
+             is in `.bob/out/verify.log`; its last line is the exit code. Fix the
+             code, not the test, unless the test itself is wrong. The workflow
+             already ran the full checks, so do not run them all again first.
+          2. Implement the open items, starting with the first one, then the next,
+             until all are done or your time runs out. Each item needs code and a
+             test. Also check ISSUE.md for requirements that PLAN.md missed, and
+             add them to PLAN.md.
+          3. Run the tests for the files you changed.
           4. Update `.bob/out/PLAN.md`, `.bob/out/PR_SUMMARY.md` and
-             `.bob/out/STATUS` so they describe the current state truthfully.
+             `.bob/out/STATUS` (one word) so they describe the current state
+             truthfully.
+
+          A pass that changes no source files is a failed pass. Checking, reviewing
+          or rewriting the summary is not progress.
           PROMPT_EOF
 
-          # Fill only these two variables; any other `$` text stays as written.
+          # Fill only these variables; any other `$` text stays as written.
           for f in "${BOB_OUT}/PROMPT_IMPLEMENT.md" "${BOB_OUT}/PROMPT_REFINE.md"; do
             # shellcheck disable=SC2016  # envsubst needs the literal variable names
-            envsubst '${ISSUE_NUMBER} ${REPOSITORY}' < "$f" > "$f.tmp"
+            envsubst '${ISSUE_NUMBER} ${REPOSITORY} ${REFINE_PASSES} ${TIMEOUT_MINUTES}' < "$f" > "$f.tmp"
             mv "$f.tmp" "$f"
           done
           # A file, not a substitution: the command can contain any character.
@@ -353,48 +427,136 @@ jobs:
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           REFINE_PASSES: ${{ inputs.refine_passes }}
           VERIFY_COMMAND: ${{ inputs.verify_command }}
+          CODE_PATHS: ${{ inputs.code_paths }}
+          TEST_PATHS: ${{ inputs.test_paths }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           # The default step shell uses `set -e`. A failing verify command is a
           # result to act on here, not a reason to stop the step.
           set +e
+          BASE="origin/${DEFAULT_BRANCH}"
+
+          # Files changed against the default branch: committed (when continuing
+          # an earlier PR branch), modified and untracked. Bob's .bob/ is excluded.
+          changed_files() {
+            { git diff --name-only "${BASE}" -- . ':!.bob'
+              git ls-files --others --exclude-standard -- . ':!.bob'; } | sort -u
+          }
+          # Changes when any source file changes; used to detect passes that
+          # made no progress.
+          fingerprint() {
+            { git diff "${BASE}" -- . ':!.bob'
+              git ls-files -z --others --exclude-standard -- . ':!.bob' | xargs -0 -r sha1sum; } | sha1sum
+          }
+
           run_verify() {
-            if [ -z "${VERIFY_COMMAND}" ]; then
+            : > "${BOB_OUT}/verify.log"
+            local rc=0
+            if [ -n "${VERIFY_COMMAND}" ]; then
+              echo "::group::verify: ${VERIFY_COMMAND}"
+              bash -eo pipefail -c "${VERIFY_COMMAND}" > "${BOB_OUT}/verify.full" 2>&1
+              rc=$?
+              # Keep the log small enough for Bob to read: the end has the failures.
+              tail -n 400 "${BOB_OUT}/verify.full" > "${BOB_OUT}/verify.log"
+              rm -f "${BOB_OUT}/verify.full"
+              cat "${BOB_OUT}/verify.log"
+              echo "::endgroup::"
+            else
               echo "no verify command configured" > "${BOB_OUT}/verify.log"
-              echo "exit code: 0" >> "${BOB_OUT}/verify.log"
-              return 0
             fi
-            echo "::group::verify: ${VERIFY_COMMAND}"
-            bash -eo pipefail -c "${VERIFY_COMMAND}" > "${BOB_OUT}/verify.log" 2>&1
-            local rc=$?
-            # Keep the log small enough for Bob to read: the end has the failures.
-            tail -n 400 "${BOB_OUT}/verify.log" > "${BOB_OUT}/verify.tmp"
-            mv "${BOB_OUT}/verify.tmp" "${BOB_OUT}/verify.log"
+            # Source changes must come with test changes.
+            if [ -n "${CODE_PATHS}" ] && [ -n "${TEST_PATHS}" ]; then
+              local code tests
+              code=$(changed_files | grep -E "${CODE_PATHS}")
+              tests=$(changed_files | grep -E "${TEST_PATHS}")
+              if [ -n "${code}" ] && [ -z "${tests}" ]; then
+                {
+                  echo
+                  echo "TEST RULE FAILED: these source files changed, but no test file changed"
+                  echo "(test files match: ${TEST_PATHS}). Add tests for the new behavior:"
+                  while IFS= read -r f; do echo "  ${f}"; done <<< "${code}"
+                } | tee -a "${BOB_OUT}/verify.log"
+                [ "${rc}" -eq 0 ] && rc=1
+              fi
+            fi
             echo "exit code: ${rc}" >> "${BOB_OUT}/verify.log"
-            cat "${BOB_OUT}/verify.log"
-            echo "::endgroup::"
             return "${rc}"
           }
-          bob_status() { tr -d '[:space:]' < "${BOB_OUT}/STATUS" 2>/dev/null || echo "MISSING"; }
+          # STATUS should hold one word; keep only the first word of the first line.
+          bob_status() {
+            local s
+            s=$(awk 'NF { print toupper($1); exit }' "${BOB_OUT}/STATUS" 2>/dev/null | tr -cd '[:upper:]')
+            echo "${s:-MISSING}"
+          }
+          open_items() { grep -E '^[[:space:]]*[-*] \[ \]' "${BOB_OUT}/PLAN.md" 2>/dev/null; }
+
+          # The task for the next refine pass: failed checks, then open items.
+          write_next() {
+            {
+              echo "# Your task in this pass (pass ${pass} of ${REFINE_PASSES} extra passes)"
+              echo
+              if [ "${no_progress}" -gt 0 ]; then
+                echo "WARNING: the previous pass changed no source files. That pass was"
+                echo "wasted. In this pass, write code for the first open item."
+                echo
+              fi
+              echo "## Failed checks"
+              echo
+              if [ "${verify_rc}" -ne 0 ]; then
+                echo "The checks failed (exit ${verify_rc}). The output is in \`.bob/out/verify.log\`."
+                grep -E "TEST RULE FAILED" -A50 "${BOB_OUT}/verify.log" | head -n 60
+              else
+                echo "None. All checks passed."
+              fi
+              echo
+              echo "## Open checklist items (from PLAN.md), in order"
+              echo
+              if [ -s "${BOB_OUT}/PLAN.md" ]; then
+                open_items || echo "None are marked open. Check ISSUE.md for requirements that PLAN.md missed."
+              else
+                echo "PLAN.md is missing. Write it first (one \`- [ ] item\` line per requirement), then implement the items."
+              fi
+            } > "${BOB_OUT}/NEXT.md"
+          }
 
           run_verify; verify_rc=$?
           pass=0
+          no_progress=0
           while [ "${pass}" -lt "${REFINE_PASSES}" ]; do
-            if [ "${verify_rc}" -eq 0 ] && [ "$(bob_status)" = "COMPLETE" ]; then
+            open_count=$(open_items | wc -l)
+            if [ "${verify_rc}" -eq 0 ] && [ "$(bob_status)" = "COMPLETE" ] && [ "${open_count}" -eq 0 ]; then
+              break
+            fi
+            if [ "${no_progress}" -ge 2 ]; then
+              echo "::warning::two passes in a row changed no source files; stopping"
               break
             fi
             pass=$((pass + 1))
-            echo "Refine pass ${pass}: verify exit ${verify_rc}, Bob status $(bob_status)"
+            echo "Refine pass ${pass}: verify exit ${verify_rc}, Bob status $(bob_status), open items ${open_count}"
+            write_next
+            before=$(fingerprint)
             "${BOB_OUT}/run-bob.sh" "${BOB_OUT}/PROMPT_REFINE.md" "${TIMEOUT_MINUTES}" \
               || echo "::warning::refine pass ${pass} ended with an error"
+            if [ "$(fingerprint)" = "${before}" ]; then
+              no_progress=$((no_progress + 1))
+              echo "::warning::refine pass ${pass} changed no source files"
+            else
+              no_progress=0
+            fi
             run_verify; verify_rc=$?
           done
 
+          # Bob's word is not enough: open checklist items mean the work is not done.
+          status=$(bob_status)
+          open_count=$(open_items | wc -l)
+          [ "${open_count}" -gt 0 ] && status=INCOMPLETE
           {
             echo "verify_rc=${verify_rc}"
-            echo "bob_status=$(bob_status)"
+            echo "bob_status=${status}"
+            echo "open_items=${open_count}"
             echo "refine_passes_used=${pass}"
           } >> "$GITHUB_OUTPUT"
-          echo "Final: verify exit ${verify_rc}, Bob status $(bob_status), refine passes ${pass}"
+          echo "Final: verify exit ${verify_rc}, Bob status ${status}, open items ${open_count}, refine passes ${pass}"
 
       - name: Upload Bob work files
         if: always()
@@ -466,6 +628,7 @@ jobs:
           VERIFY_RC: ${{ steps.verify.outputs.verify_rc }}
           BOB_STATUS: ${{ steps.verify.outputs.bob_status }}
           REFINE_USED: ${{ steps.verify.outputs.refine_passes_used }}
+          OPEN_ITEMS: ${{ steps.verify.outputs.open_items }}
           VERIFY_COMMAND: ${{ inputs.verify_command }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -483,7 +646,7 @@ jobs:
           if [ "${BOB_STATUS}" = "COMPLETE" ]; then
             STATUS_LINE="Bob reports that every requirement is done."
           else
-            STATUS_LINE="⚠️ Bob reports that some requirements are **not done** (status: ${BOB_STATUS}). See the unchecked items below."
+            STATUS_LINE="⚠️ Some requirements are **not done** (Bob status: ${BOB_STATUS}, open checklist items: ${OPEN_ITEMS:-unknown}). See the unchecked items below."
           fi
 
           DRAFT=false
