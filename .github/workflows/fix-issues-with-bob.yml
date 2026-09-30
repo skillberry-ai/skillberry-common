@@ -227,10 +227,20 @@ jobs:
             echo "Open PR #${PREV_NUMBER} found on ${HEAD_REPO}:${BRANCH_NAME}; continuing from it"
             git fetch -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${HEAD_REPO}.git" "${BRANCH_NAME}"
             git checkout -q -b "${BRANCH_NAME}" FETCH_HEAD
-            # Bring in newer main; on a conflict keep the branch as it is.
+            # Bring in newer main. On a conflict, stop: work done on a branch that
+            # cannot merge ends in a PR nobody can merge (this happened when a PR
+            # for the issue was squash-merged while a run was still working on it).
             if ! git merge -q --no-edit "origin/${DEFAULT_BRANCH}"; then
+              CONFLICTS=$(git diff --name-only --diff-filter=U | head -n 20)
               git merge --abort
-              echo "::warning::could not merge ${DEFAULT_BRANCH} into ${BRANCH_NAME}; continuing without it"
+              echo "::error::${BRANCH_NAME} (PR #${PREV_NUMBER}) conflicts with ${DEFAULT_BRANCH}"
+              # shellcheck disable=SC2016  # the backticks are literal Markdown
+              gh issue comment "${ISSUE_NUMBER}" --repo "${GH_REPOSITORY}" --body "$(printf '%s\n\n%s\n\n```\n%s\n```\n\n%s' \
+                "🤖 Bob Shell did not start: branch \`${BRANCH_NAME}\` of PR #${PREV_NUMBER} conflicts with \`${DEFAULT_BRANCH}\`." \
+                "Conflicting files:" "${CONFLICTS}" \
+                "Rebase or merge \`${DEFAULT_BRANCH}\` into that branch (or close PR #${PREV_NUMBER} to start fresh), then re-add the \`fix-with-bob\` label.")"
+              echo "BRANCH_CONFLICT=true" >> "$GITHUB_ENV"
+              exit 1
             fi
             {
               echo "# Earlier work on this issue"
@@ -664,6 +674,21 @@ jobs:
             DRAFT=true
           fi
 
+          # Test-merge into the latest default branch. It can have moved during the
+          # run, for example when a PR for this issue was merged meanwhile. GitHub
+          # does not run pull_request CI on a conflicting PR, so say so loudly.
+          CONFLICT_LINE=""
+          git fetch -q origin "${DEFAULT_BRANCH}"
+          if ! git merge-tree --write-tree "origin/${DEFAULT_BRANCH}" HEAD > "${RUNNER_TEMP}/merge-tree.txt"; then
+            CONFLICT_FILES=$(grep -E '^CONFLICT' "${RUNNER_TEMP}/merge-tree.txt" | head -n 10)
+            CONFLICT_LINE="❌ This branch **conflicts with \`${DEFAULT_BRANCH}\`**, so CI will not run. Rebase it before review."
+            DRAFT=true
+            # shellcheck disable=SC2016  # the backticks are literal Markdown
+            gh issue comment "${ISSUE_NUMBER}" --repo "${GH_REPOSITORY}" --body "$(printf '%s\n\n```\n%s\n```' \
+              "⚠️ Bob's branch \`${BRANCH_NAME}\` conflicts with \`${DEFAULT_BRANCH}\`, which changed during this run (was a PR for this issue merged meanwhile?). The PR is a draft until it is rebased." \
+              "${CONFLICT_FILES}")"
+          fi
+
           # Bob's summary is written by the model; it only ever reaches the PR
           # body as data (a file read into a variable), never as shell source.
           if [ -s "${BOB_OUT}/PR_SUMMARY.md" ]; then
@@ -679,6 +704,7 @@ jobs:
             echo
             echo "- ${VERIFY_LINE}"
             echo "- ${STATUS_LINE}"
+            [ -n "${CONFLICT_LINE}" ] && echo "- ${CONFLICT_LINE}"
             echo "- Extra Bob passes used: ${REFINE_USED:-0}. Workflow run: ${RUN_URL}"
             echo
             echo "${SUMMARY}"
@@ -764,7 +790,8 @@ jobs:
             --body "🤖 Bob Shell analyzed this issue but did not generate any code changes. Manual intervention may be required."
 
       - name: Handle Errors
-        if: failure()
+        # A branch conflict already posted its own, specific comment.
+        if: failure() && env.BRANCH_CONFLICT != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.SKILLBERRY_BOT_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
