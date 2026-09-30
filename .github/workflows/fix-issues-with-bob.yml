@@ -131,7 +131,17 @@ jobs:
           # `bob --accept-license -p ...` invocations (no TTY on GitHub-hosted
           # runners). Revisit the pin once 2.x's non-interactive mode is
           # confirmed fixed.
-          curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash -s -- --package-manager npm --version 1.0.6
+          # The installer downloads the package and its checksum from IBM's S3
+          # bucket, which sometimes fails for a short time. Retry before failing
+          # the whole run.
+          for attempt in 1 2 3 4; do
+            if curl -fsSL https://bob.ibm.com/download/bobshell.sh \
+                | bash -s -- --package-manager npm --version 1.0.6; then
+              break
+            fi
+            echo "::warning::Bob Shell install attempt ${attempt} failed"
+            [ "${attempt}" -lt 4 ] && sleep $((attempt * 30))
+          done
 
           if command -v bob &> /dev/null; then
             echo "Bob Shell installed successfully"
